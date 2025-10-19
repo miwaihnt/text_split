@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000";
+const DEFAULT_API_BASE_URL = "https://text-split.onrender.com";
 
 const getApiBaseUrl = () =>
   process.env.NEXT_PUBLIC_SENTENCE_API_BASE_URL?.replace(/\/+$/, "") ?? DEFAULT_API_BASE_URL;
