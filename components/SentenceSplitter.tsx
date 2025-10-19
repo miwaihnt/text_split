@@ -2,10 +2,14 @@
 
 import { useMemo, useRef, useState } from "react";
 import { splitTextViaApi } from "@/lib/api";
+import { chunkSentences } from "@/lib/chunkSentences";
 import { stripTrailingPunctuation, type SplitOptions } from "@/lib/splitText";
-import AdSlot from "./AdSlot";
 
 const MAX_CHAR_COUNT = 10000;
+const TEXT_FILE_PATTERN = /\.(txt|md|csv)$/i;
+
+const isTextFile = (file: File) =>
+  file.type.startsWith("text/") || TEXT_FILE_PATTERN.test(file.name);
 
 const defaultOptions: SplitOptions & { outputAsJson: boolean } = {
   removeLineBreaks: false,
@@ -20,6 +24,9 @@ const SentenceSplitter = () => {
   const [error, setError] = useState<string | null>(null);
   const [copyState, setCopyState] = useState<"json" | "text" | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isDragActive, setIsDragActive] = useState(false);
+  const [maxTokensInput, setMaxTokensInput] = useState("512");
+  const [overlapTokensInput, setOverlapTokensInput] = useState("64");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const characterCount = inputText.length;
@@ -31,52 +38,83 @@ const SentenceSplitter = () => {
     }));
   };
 
-  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) {
+  const processTextFiles = async (fileList: FileList | File[]) => {
+    const textFiles = Array.from(fileList).filter(isTextFile);
+
+    if (textFiles.length === 0) {
+      setError("Only text-based files are supported.");
       return;
     }
 
-    if (file.size === 0) {
-      setError("Selected file is empty.");
-      event.target.value = "";
-      return;
-    }
+    try {
+      const contents = await Promise.all(textFiles.map((file) => file.text()));
+      const joined = contents.map((content) => content.replace(/\r/g, "")).join("\n\n");
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      const text = typeof reader.result === "string" ? reader.result : "";
-      if (!text) {
-        setError("Failed to read file content.");
-        event.target.value = "";
+      if (!joined.trim()) {
+        setError("Selected files were empty.");
         return;
       }
 
-      let nextText = text;
-      let nextError: string | null = null;
+      let truncated = false;
+      let nextTextValue = joined;
 
-      if (text.length > MAX_CHAR_COUNT) {
-        nextText = text.slice(0, MAX_CHAR_COUNT);
-        nextError = "File truncated to first 5,000 characters.";
+      if (joined.length > MAX_CHAR_COUNT) {
+        truncated = true;
+        nextTextValue = joined.slice(0, MAX_CHAR_COUNT);
       }
 
-      setInputText(nextText);
+      setInputText(nextTextValue);
       setSentences([]);
       setCopyState(null);
-      setError(nextError);
-      event.target.value = "";
-    };
-
-    reader.onerror = () => {
+      setError(truncated ? "Content truncated to first 10,000 characters." : null);
+    } catch (fileError) {
+      console.error("Failed to read text files", fileError);
       setError("Failed to read file content.");
-      event.target.value = "";
-    };
+    }
+  };
 
-    reader.readAsText(file);
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const input = event.target;
+    const { files } = input;
+
+    if (!files || files.length === 0) {
+      return;
+    }
+
+    await processTextFiles(files);
+    input.value = "";
   };
 
   const triggerFileSelect = () => {
     fileInputRef.current?.click();
+  };
+
+  const handleDragOver = (event: React.DragEvent<HTMLTextAreaElement>) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    if (!isDragActive) {
+      setIsDragActive(true);
+    }
+  };
+
+  const handleDragLeave = (event: React.DragEvent<HTMLTextAreaElement>) => {
+    event.preventDefault();
+    setIsDragActive(false);
+  };
+
+  const handleDrop = async (event: React.DragEvent<HTMLTextAreaElement>) => {
+    event.preventDefault();
+    setIsDragActive(false);
+
+    const dataTransfer = event.dataTransfer;
+    const { files } = dataTransfer;
+
+    if (!files || files.length === 0) {
+      return;
+    }
+
+    await processTextFiles(files);
+    dataTransfer.clearData();
   };
 
   const handleSplit = async () => {
@@ -133,6 +171,56 @@ const SentenceSplitter = () => {
     [sentences]
   );
 
+  const parsedMaxTokens = useMemo(() => {
+    const parsed = Math.floor(Number(maxTokensInput));
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return 1;
+    }
+    return parsed;
+  }, [maxTokensInput]);
+
+  const parsedOverlapTokens = useMemo(() => {
+    const parsed = Math.floor(Number(overlapTokensInput));
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return 0;
+    }
+    return Math.min(parsed, parsedMaxTokens);
+  }, [overlapTokensInput, parsedMaxTokens]);
+
+  const chunkPreview = useMemo(
+    () => chunkSentences(sentences, parsedMaxTokens, parsedOverlapTokens),
+    [sentences, parsedMaxTokens, parsedOverlapTokens]
+  );
+
+  const handleMaxTokensChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const nextValue = event.target.value.replace(/[^\d]/g, "");
+    setMaxTokensInput(nextValue);
+  };
+
+  const handleOverlapTokensChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const nextValue = event.target.value.replace(/[^\d]/g, "");
+    setOverlapTokensInput(nextValue);
+  };
+
+  const handleMaxTokensBlur = () => {
+    const sanitizedMax = String(parsedMaxTokens);
+    if (sanitizedMax !== maxTokensInput) {
+      setMaxTokensInput(sanitizedMax);
+    }
+
+    const clampedOverlap = String(parsedOverlapTokens);
+    if (clampedOverlap !== overlapTokensInput) {
+      setOverlapTokensInput(clampedOverlap);
+    }
+  };
+
+  const handleOverlapTokensBlur = () => {
+    const sanitizedOverlap = String(parsedOverlapTokens);
+    if (sanitizedOverlap !== overlapTokensInput) {
+      setOverlapTokensInput(sanitizedOverlap);
+    }
+  };
+
   const handleCopy = async (type: "json" | "text") => {
     const value = type === "json" ? jsonOutput : plainTextOutput;
 
@@ -161,24 +249,32 @@ const SentenceSplitter = () => {
 
   return (
     <section className="space-y-6">
-      <div className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-900/5">
-        <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-          <div className="flex-1 space-y-3">
-            <h1 className="text-2xl font-semibold text-slate-900 md:text-3xl">
-              Sentence Splitter for AI
-            </h1>
-            <p className="text-sm text-slate-600 md:text-base">
-              Paste up to 5,000 characters of English text and split it into clean sentences ready
-              for LLM and RAG pipelines. Export as JSON or copy a numbered plain text list.
-            </p>
+      <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-slate-900/70 p-8 shadow-2xl backdrop-blur md:p-12">
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(circle_at_top,_rgba(251,191,36,0.18),_transparent_55%)]"
+        />
+        <div className="flex flex-col gap-6 md:flex-row md:items-start md:justify-between">
+          <div className="flex-1 space-y-4">
+            <span className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-4 py-1 text-xs font-semibold uppercase tracking-wider text-amber-300">
+              Built for LLM workflows
+            </span>
+            <div className="space-y-3">
+              <h1 className="text-3xl font-semibold text-slate-50 md:text-4xl">
+                Sentence Splitter for LLMs
+              </h1>
+              <p className="text-sm text-slate-200 md:text-lg">
+                Split your text into clean, model-ready sentences for RAG, training, and evaluation.
+              </p>
+            </div>
           </div>
-          <div className="grid gap-2 text-sm">
+          <div className="grid gap-3 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-100 md:w-72">
             <label className="flex items-center gap-2">
               <input
                 type="checkbox"
                 checked={options.removeLineBreaks}
                 onChange={() => handleToggle("removeLineBreaks")}
-                className="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary"
+                className="h-4 w-4 rounded border-white/30 bg-slate-900/80 text-amber-300 focus:ring-amber-300 focus:ring-offset-0"
               />
               Remove line breaks
             </label>
@@ -187,7 +283,7 @@ const SentenceSplitter = () => {
                 type="checkbox"
                 checked={options.keepPunctuation}
                 onChange={() => handleToggle("keepPunctuation")}
-                className="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary"
+                className="h-4 w-4 rounded border-white/30 bg-slate-900/80 text-amber-300 focus:ring-amber-300 focus:ring-offset-0"
               />
               Keep punctuation
             </label>
@@ -196,7 +292,7 @@ const SentenceSplitter = () => {
                 type="checkbox"
                 checked={options.outputAsJson}
                 onChange={() => handleToggle("outputAsJson")}
-                className="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary"
+                className="h-4 w-4 rounded border-white/30 bg-slate-900/80 text-amber-300 focus:ring-amber-300 focus:ring-offset-0"
               />
               Output as JSON
             </label>
@@ -204,7 +300,7 @@ const SentenceSplitter = () => {
         </div>
 
         <div className="mt-6 space-y-3">
-          <label htmlFor="input-text" className="text-sm font-medium text-slate-700">
+          <label htmlFor="input-text" className="text-sm font-medium text-slate-200">
             Input text
           </label>
           <textarea
@@ -212,26 +308,36 @@ const SentenceSplitter = () => {
             value={inputText}
             onChange={(event) => setInputText(event.target.value)}
             maxLength={MAX_CHAR_COUNT}
+            onDragOver={handleDragOver}
+            onDragEnter={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
             placeholder="Paste your English text here..."
-            className="h-48 w-full resize-y rounded-xl border border-slate-200 bg-slate-50/60 p-4 text-sm leading-6 text-slate-900 shadow-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/30"
+            className={`h-48 w-full resize-y rounded-2xl border ${
+              isDragActive ? "border-amber-300 ring-2 ring-amber-300/40" : "border-white/15"
+            } bg-slate-950/60 p-4 text-sm leading-6 text-slate-100 shadow-lg transition focus:border-amber-300 focus:outline-none focus:ring-2 focus:ring-amber-300/40`}
           />
           <input
             ref={fileInputRef}
             type="file"
             accept=".txt,.md,.csv,text/plain"
+            multiple
             className="hidden"
             onChange={handleFileUpload}
           />
-          <div className="flex items-center justify-between text-xs text-slate-500">
+          <div className="flex items-center justify-between text-xs text-slate-300">
             <span>{characterCount.toLocaleString()} / 10,000 characters</span>
-            {error ? <span className="text-red-500">{error}</span> : null}
+            {error ? <span className="text-amber-300">{error}</span> : null}
           </div>
+          <p className="text-xs text-slate-400">
+            Tip: Drag and drop multiple .txt, .md, or .csv files to populate the input.
+          </p>
 
           <div className="flex flex-wrap items-center gap-3">
             <button
               type="button"
               onClick={handleSplit}
-              className="inline-flex items-center justify-center rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:bg-slate-300"
+              className="inline-flex items-center justify-center rounded-full bg-amber-400 px-5 py-2 text-sm font-semibold text-slate-950 shadow-lg transition hover:bg-amber-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-200 disabled:cursor-not-allowed disabled:bg-slate-500 disabled:text-slate-200"
               disabled={!characterCount || isLoading}
             >
               {isLoading ? "Splitting…" : "Split sentences"}
@@ -239,7 +345,7 @@ const SentenceSplitter = () => {
             <button
               type="button"
               onClick={handleReset}
-              className="inline-flex items-center justify-center rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:cursor-not-allowed disabled:opacity-60"
+              className="inline-flex items-center justify-center rounded-full border border-white/20 px-5 py-2 text-sm font-semibold text-slate-100 shadow-sm transition hover:border-white/40 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-200 disabled:cursor-not-allowed disabled:opacity-60"
               disabled={!characterCount || isLoading}
             >
               Clear
@@ -247,89 +353,176 @@ const SentenceSplitter = () => {
             <button
               type="button"
               onClick={triggerFileSelect}
-              className="inline-flex items-center justify-center rounded-lg border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/20"
+              className="inline-flex items-center justify-center rounded-full border border-white/20 px-5 py-2 text-sm font-semibold text-slate-100 shadow-sm transition hover:border-white/40 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-200"
             >
-              Upload text file
+              Upload text files
             </button>
             {sentences.length > 0 ? (
-              <p className="text-xs text-slate-500">{sentences.length} sentences detected.</p>
+              <p className="text-xs text-slate-200">{sentences.length} sentences detected.</p>
             ) : null}
           </div>
         </div>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-3">
-        <div className="lg:col-span-2">
-          <div className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-900/5">
-            <h2 className="text-lg font-semibold text-slate-900">Output</h2>
-            {sentences.length === 0 ? (
-              <p className="mt-3 text-sm text-slate-500">
-                Run the splitter to see JSON and plain text output formats.
-              </p>
-            ) : (
-              <div className="mt-4 space-y-6">
-                {options.outputAsJson ? (
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <h3 className="text-sm font-medium text-slate-700">JSON Array</h3>
-                      <button
-                        type="button"
-                        onClick={() => handleCopy("json")}
-                        className="text-xs font-medium text-primary hover:underline"
-                      >
-                        {copyState === "json" ? "Copied!" : "Copy JSON"}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleDownloadJson}
-                        className="text-xs font-medium text-primary hover:underline"
-                      >
-                        Download JSON
-                      </button>
-                    </div>
-                    <pre className="max-h-64 overflow-auto rounded-lg bg-slate-900/95 p-4 text-xs text-slate-50">
-                      {jsonOutput}
-                    </pre>
-                  </div>
-                ) : null}
-
+      <div className="space-y-6">
+        <div className="rounded-3xl border border-white/10 bg-slate-900/70 p-6 shadow-2xl backdrop-blur">
+          <h2 className="text-lg font-semibold text-white">Output</h2>
+          {sentences.length === 0 ? (
+            <p className="mt-3 text-sm text-slate-300">
+              Run the splitter to see JSON and plain text output formats.
+            </p>
+          ) : (
+            <div className="mt-4 space-y-6">
+              {options.outputAsJson ? (
                 <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-medium text-slate-700">Plain Text</h3>
+                  <div className="flex items-center justify-between text-slate-200">
+                    <h3 className="text-sm font-medium">JSON Array</h3>
                     <button
                       type="button"
-                      onClick={() => handleCopy("text")}
-                      className="text-xs font-medium text-primary hover:underline"
+                      onClick={() => handleCopy("json")}
+                      className="text-xs font-medium text-amber-300 hover:underline"
                     >
-                      {copyState === "text" ? "Copied!" : "Copy Plain Text"}
+                      {copyState === "json" ? "Copied!" : "Copy JSON"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDownloadJson}
+                      className="text-xs font-medium text-amber-300 hover:underline"
+                    >
+                      Download JSON
                     </button>
                   </div>
-                  <pre className="max-h-64 overflow-auto rounded-lg bg-slate-100 p-4 text-xs text-slate-800">
-                    {plainTextOutput}
+                  <pre className="max-h-64 overflow-auto rounded-2xl bg-slate-950/90 p-4 text-xs text-slate-100 ring-1 ring-white/10">
+                    {jsonOutput}
                   </pre>
                 </div>
+              ) : null}
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-slate-200">
+                  <h3 className="text-sm font-medium">Plain Text</h3>
+                  <button
+                    type="button"
+                    onClick={() => handleCopy("text")}
+                    className="text-xs font-medium text-amber-300 hover:underline"
+                  >
+                    {copyState === "text" ? "Copied!" : "Copy Plain Text"}
+                  </button>
+                </div>
+                <pre className="max-h-64 overflow-auto rounded-2xl bg-slate-950/70 p-4 text-xs text-slate-100 ring-1 ring-white/10">
+                  {plainTextOutput}
+                </pre>
               </div>
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-3xl border border-white/10 bg-slate-900/70 p-6 shadow-2xl backdrop-blur">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h2 className="text-base font-semibold text-white">Chunk preview</h2>
+              <p className="mt-1 text-xs text-slate-300">
+                Visualize approximate chunking with token limits and overlap.
+              </p>
+            </div>
+          </div>
+          <div className="mt-4 space-y-4">
+            <div className="grid grid-cols-2 gap-3">
+              <label className="flex flex-col gap-1 text-xs text-slate-200">
+                Max tokens
+                <input
+                  type="number"
+                  min={1}
+                  value={maxTokensInput}
+                  onChange={handleMaxTokensChange}
+                  onBlur={handleMaxTokensBlur}
+                  inputMode="numeric"
+                  className="rounded-xl border border-white/15 bg-slate-950/70 px-3 py-2 text-sm text-white shadow-inner focus:border-amber-300 focus:outline-none focus:ring-2 focus:ring-amber-300/40"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-xs text-slate-200">
+                Overlap tokens
+                <input
+                  type="number"
+                  min={0}
+                  value={overlapTokensInput}
+                  onChange={handleOverlapTokensChange}
+                  onBlur={handleOverlapTokensBlur}
+                  inputMode="numeric"
+                  className="rounded-xl border border-white/15 bg-slate-950/70 px-3 py-2 text-sm text-white shadow-inner focus:border-amber-300 focus:outline-none focus:ring-2 focus:ring-amber-300/40"
+                />
+              </label>
+            </div>
+            <p className="text-xs text-slate-400">
+              Token counts are approximated by whitespace splitting for quick insight.
+            </p>
+          </div>
+          <div className="mt-6 space-y-4">
+            {chunkPreview.length === 0 ? (
+              <p className="text-sm text-slate-300">
+                Run the splitter to explore how chunks are distributed.
+              </p>
+            ) : (
+              chunkPreview.map((chunk) => {
+                const startIndex = chunk.indices.length > 0 ? chunk.indices[0] + 1 : undefined;
+                const endIndex =
+                  chunk.indices.length > 0
+                    ? chunk.indices[chunk.indices.length - 1] + 1
+                    : startIndex;
+
+                return (
+                  <div
+                    key={chunk.id}
+                    className="rounded-2xl border border-white/10 bg-slate-950/70 p-4 text-xs text-slate-100 shadow-sm"
+                  >
+                    <div className="flex items-center justify-between text-slate-200">
+                      <h3 className="text-sm font-semibold">Chunk {chunk.id}</h3>
+                      <span className="text-xs text-amber-300">
+                        {chunk.tokenCount.toLocaleString()} tokens
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-slate-400">
+                      Sentences: {chunk.sentences.length.toLocaleString()} •{" "}
+                      {typeof startIndex === "number" && typeof endIndex === "number" ? (
+                        <>Range #{startIndex}–{endIndex}</>
+                      ) : (
+                        <>Range unavailable</>
+                      )}
+                    </p>
+                    <div className="mt-3 space-y-2 rounded-xl bg-slate-900/80 p-3 ring-1 ring-white/5">
+                      {chunk.sentences.map((sentence, idx) => (
+                        <p
+                          key={`${chunk.id}-${chunk.indices[idx] ?? idx}`}
+                          className="text-slate-200"
+                        >
+                          <span className="mr-2 text-slate-500">
+                            #
+                            {chunk.indices[idx] !== undefined
+                              ? chunk.indices[idx] + 1
+                              : typeof startIndex === "number"
+                              ? startIndex + idx
+                              : idx + 1}
+                          </span>
+                          {sentence}
+                        </p>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })
             )}
           </div>
         </div>
 
-        <aside className="space-y-4">
-          <div className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-900/5">
-            <h2 className="text-base font-semibold text-slate-900">How it works</h2>
-            <ul className="mt-3 list-disc space-y-2 pl-6 text-sm text-slate-600">
-              <li>Trim the input and optionally collapse line breaks.</li>
-              <li>Split sentences with regex on `.`, `!`, `?` followed by whitespace.</li>
-              <li>Remove trailing punctuation when toggled off.</li>
-            </ul>
-          </div>
-        </aside>
+        <div className="rounded-3xl border border-white/10 bg-slate-900/70 p-6 shadow-2xl backdrop-blur">
+          <h2 className="text-base font-semibold text-white">How it works</h2>
+          <ul className="mt-3 list-disc space-y-2 pl-6 text-sm text-slate-300">
+            <li>Trim the input and optionally collapse line breaks.</li>
+            <li>Split sentences with regex on `.`, `!`, `?` followed by whitespace.</li>
+            <li>Remove trailing punctuation when toggled off.</li>
+          </ul>
+        </div>
       </div>
-
-      <AdSlot
-        label="Responsive Ad"
-        dimensions="300 × 250"
-        className="mx-auto h-[250px] w-full max-w-[300px] sm:max-w-[320px]"
-      />
     </section>
   );
 };
